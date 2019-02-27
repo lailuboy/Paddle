@@ -16,7 +16,6 @@ add_subdirectory(utils)
 if (TENSORRT_FOUND)
   add_subdirectory(tensorrt)
 endif()
-# add_subdirectory(anakin)
 
 get_property(fluid_modules GLOBAL PROPERTY FLUID_MODULES)
 get_property(cuda_modules GLOBAL PROPERTY CUDA_MODULES)
