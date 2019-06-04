@@ -10,6 +10,7 @@
    limitations under the License. */
 
 #include "paddle/fluid/operators/detection/yolov3_loss_op.h"
+#include <memory>
 #include "paddle/fluid/framework/op_registry.h"
 
 namespace paddle {
@@ -72,6 +73,18 @@ class Yolov3LossOp : public framework::OperatorWithKernel {
     PADDLE_ENFORCE_GT(class_num, 0,
                       "Attr(class_num) should be an integer greater then 0.");
 
+    if (ctx->HasInput("GTScore")) {
+      auto dim_gtscore = ctx->GetInputDim("GTScore");
+      PADDLE_ENFORCE_EQ(dim_gtscore.size(), 2,
+                        "Input(GTScore) should be a 2-D tensor");
+      PADDLE_ENFORCE_EQ(
+          dim_gtscore[0], dim_gtbox[0],
+          "Input(GTBox) and Input(GTScore) dim[0] should be same");
+      PADDLE_ENFORCE_EQ(
+          dim_gtscore[1], dim_gtbox[1],
+          "Input(GTBox) and Input(GTScore) dim[1] should be same");
+    }
+
     std::vector<int64_t> dim_out({dim_x[0]});
     ctx->SetOutputDim("Loss", framework::make_ddim(dim_out));
 
@@ -112,6 +125,12 @@ class Yolov3LossOpMaker : public framework::OpProtoAndCheckerMaker {
              "This is a 2-D tensor with shape of [N, max_box_num], "
              "and each element should be an integer to indicate the "
              "box class id.");
+    AddInput("GTScore",
+             "The score of GTLabel, This is a 2-D tensor in same shape "
+             "GTLabel, and score values should in range (0, 1). This "
+             "input is for GTLabel score can be not 1.0 in image mixup "
+             "augmentation.")
+        .AsDispensable();
     AddOutput("Loss",
               "The output yolov3 loss tensor, "
               "This is a 1-D tensor with shape of [N]");
@@ -143,14 +162,17 @@ class Yolov3LossOpMaker : public framework::OpProtoAndCheckerMaker {
     AddAttr<float>("ignore_thresh",
                    "The ignore threshold to ignore confidence loss.")
         .SetDefault(0.7);
+    AddAttr<bool>("use_label_smooth",
+                  "Whether to use label smooth. Default True.")
+        .SetDefault(true);
     AddComment(R"DOC(
          This operator generates yolov3 loss based on given predict result and ground
          truth boxes.
          
          The output of previous network is in shape [N, C, H, W], while H and W
          should be the same, H and W specify the grid size, each grid point predict 
-         given number boxes, this given number, which following will be represented as S,
-         is specified by the number of anchors, In the second dimension(the channel
+         given number bounding boxes, this given number, which following will be represented as S,
+         is specified by the number of anchor clusters in each scale. In the second dimension(the channel
          dimension), C should be equal to S * (class_num + 5), class_num is the object 
          category number of source dataset(such as 80 in coco dataset), so in the 
          second(channel) dimension, apart from 4 box location coordinates x, y, w, h, 
@@ -180,13 +202,13 @@ class Yolov3LossOpMaker : public framework::OpProtoAndCheckerMaker {
          the max IoU should be 1, and if the anchor box has IoU bigger than ignore 
          thresh, the confidence score loss of this anchor box will be ignored.
 
-         Therefore, the yolov3 loss consist of three major parts, box location loss,
-         confidence score loss, and classification loss. The L2 loss is used for 
-         box coordinates (w, h), and sigmoid cross entropy loss is used for box 
-         coordinates (x, y), confidence score loss and classification loss.
+         Therefore, the yolov3 loss consists of three major parts: box location loss,
+         objectness loss and classification loss. The L1 loss is used for 
+         box coordinates (w, h), sigmoid cross entropy loss is used for box 
+         coordinates (x, y), objectness loss and classification loss.
 
-         Each groud truth box find a best matching anchor box in all anchors, 
-         prediction of this anchor box will incur all three parts of losses, and
+         Each groud truth box finds a best matching anchor box in all anchors. 
+         Prediction of this anchor box will incur all three parts of losses, and
          prediction of anchor boxes with no GT box matched will only incur objectness
          loss.
 
@@ -204,6 +226,15 @@ class Yolov3LossOpMaker : public framework::OpProtoAndCheckerMaker {
          loss = (loss_{xy} + loss_{wh}) * weight_{box}
               + loss_{conf} + loss_{class}
          $$
+
+         While :attr:`use_label_smooth` is set to be :attr:`True`, the classification
+         target will be smoothed when calculating classification loss, target of 
+         positive samples will be smoothed to :math:`1.0 - 1.0 / class\_num` and target of
+         negetive samples will be smoothed to :math:`1.0 / class\_num`.
+
+         While :attr:`GTScore` is given, which means the mixup score of ground truth 
+         boxes, all losses incured by a ground truth box will be multiplied by its 
+         mixup score.
          )DOC");
   }
 };
@@ -240,6 +271,7 @@ class Yolov3LossGradMaker : public framework::SingleGradOpDescMaker {
     op->SetInput("X", Input("X"));
     op->SetInput("GTBox", Input("GTBox"));
     op->SetInput("GTLabel", Input("GTLabel"));
+    op->SetInput("GTScore", Input("GTScore"));
     op->SetInput(framework::GradVarName("Loss"), OutputGrad("Loss"));
     op->SetInput("ObjectnessMask", Output("ObjectnessMask"));
     op->SetInput("GTMatchMask", Output("GTMatchMask"));
@@ -249,6 +281,7 @@ class Yolov3LossGradMaker : public framework::SingleGradOpDescMaker {
     op->SetOutput(framework::GradVarName("X"), InputGrad("X"));
     op->SetOutput(framework::GradVarName("GTBox"), {});
     op->SetOutput(framework::GradVarName("GTLabel"), {});
+    op->SetOutput(framework::GradVarName("GTScore"), {});
     return std::unique_ptr<framework::OpDesc>(op);
   }
 };

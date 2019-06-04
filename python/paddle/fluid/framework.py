@@ -26,6 +26,7 @@ import six
 
 import numpy as np
 import subprocess
+import multiprocessing
 
 from .. import compat as cpt
 from .proto import framework_pb2
@@ -63,6 +64,10 @@ __all__ = [
     'default_main_program',
     'program_guard',
     'name_scope',
+    'cuda_places',
+    'cpu_places',
+    'cuda_pinned_places',
+    'in_dygraph_mode',
 ]
 
 EMPTY_VAR_NAME = core.kEmptyVarName()
@@ -71,29 +76,134 @@ GRAD_VAR_SUFFIX = core.kGradVarSuffix()
 ZERO_VAR_SUFFIX = core.kZeroVarSuffix()
 CONTROL_DEP_VAR_PREFIX = core.kControlDepVarName()
 
-_imperative_tracer_ = None
-_imperative_current_expected_place_ = None
+_dygraph_tracer_ = None
+_dygraph_current_expected_place_ = None
 
 
-def _in_imperative_mode():
-    return _imperative_tracer_ is not None
+def in_dygraph_mode():
+    """
+    Check program status(tracer), Whether it runs in dygraph mode or not
+
+    Returns:
+        out (boolean): True if the program is running in dynamic graph mode
+
+    Examples:
+        .. code-block:: python
+
+            if fluid.in_dygraph_mode():
+                pass
+
+    """
+    return _dygraph_tracer_ is not None
 
 
-def _imperative_tracer():
-    return _imperative_tracer_
+def _dygraph_tracer():
+    return _dygraph_tracer_
 
 
 def _current_expected_place():
-    return _imperative_current_expected_place_
+    return _dygraph_current_expected_place_
 
 
-def is_pserver_mode(main_program):
-    main = main_program if main_program \
-        else default_main_program()
-    for op in main.global_block().ops:
-        if op.type in ["send", "recv"]:
-            return True
-    return False
+def _cpu_num():
+    return int(os.environ.get('CPU_NUM', multiprocessing.cpu_count()))
+
+
+def cuda_places(device_ids=None):
+    """
+    Create a list of :code:`fluid.CUDAPlace` objects.
+
+    If :code:`device_ids` is None, environment variable of
+    :code:`FLAGS_selected_gpus` would be checked first. If
+    :code:`FLAGS_selected_gpus=0,1,2`, the returned list would
+    be [fluid.CUDAPlace(0), fluid.CUDAPlace(1), fluid.CUDAPlace(2)].
+    If :code:`FLAGS_selected_gpus` is not set, all visible
+    gpu places would be returned.  
+
+    If :code:`device_ids` is not None, it should be the device
+    ids of gpus. For example, if :code:`device_ids=[0,1,2]`, 
+    the returned list would be 
+    [fluid.CUDAPlace(0), fluid.CUDAPlace(1), fluid.CUDAPlace(2)].
+    
+    Args: 
+        device_ids (None|list(int)|tuple(int)): gpu device id list.
+
+    Returns:
+        out (list(fluid.CUDAPlace)): gpu place list.
+
+    Examples:
+        .. code-block:: python
+
+            cuda_places = fluid.cuda_places()
+
+    """
+    assert core.is_compiled_with_cuda(), \
+        "Not compiled with CUDA"
+    if device_ids is None:
+        gpus_env = os.getenv("FLAGS_selected_gpus")
+        if gpus_env:
+            device_ids = [int(s) for s in gpus_env.split(",")]
+        else:
+            device_ids = six.moves.range(core.get_cuda_device_count())
+    elif not isinstance(device_ids, (list, tuple)):
+        device_ids = [device_ids]
+    return [core.CUDAPlace(dev_id) for dev_id in device_ids]
+
+
+def cpu_places(device_count=None):
+    """
+    Create a list of :code:`fluid.CPUPlace` objects.
+    
+    If :code:`device_count` is None, the device count would
+    be determined by environment variable :code:`CPU_NUM`. 
+    If :code:`CPU_NUM` is not set, the device count would
+    be determined by :code:`multiprocessing.cpu_count()`. 
+
+    Args:
+        device_count (None|int): device number.
+
+    Returns:
+        out (list(fluid.CPUPlace)): cpu place list.
+
+    Examples:
+        .. code-block:: python
+
+            cpu_places = fluid.cpu_places()
+    """
+
+    if device_count is None:
+        device_count = _cpu_num()
+    return [core.CPUPlace()] * device_count
+
+
+def cuda_pinned_places(device_count=None):
+    """
+    Create a list of :code:`fluid.CUDAPinnedPlace` objects.
+
+    If :code:`device_count` is None, the device count would
+    be determined by environment variable :code:`CPU_NUM`. 
+    If :code:`CPU_NUM` is not set, the device count would
+    be determined by :code:`multiprocessing.cpu_count()`. 
+
+    Args:
+        device_count (None|int): device number.
+
+    Returns:
+        out (list(fluid.CUDAPinnedPlace)): cuda pinned place list.
+
+    Examples:
+        .. code-block:: python
+
+            cuda_pinned_places_cpu_num = fluid.cuda_pinned_places()
+            # or
+            cuda_pinned_places = fluid.cuda_pinned_places(1)
+
+    """
+    assert core.is_compiled_with_cuda(), \
+        "Not compiled with CUDA"
+    if device_count is None:
+        device_count = _cpu_num()
+    return [core.cuda_pinned_places()] * device_count
 
 
 class NameScope(object):
@@ -136,12 +246,17 @@ def name_scope(prefix=None):
     Examples:
         .. code-block:: python
 
-          with name_scope("encoder"):
-             ...
-          with name_scope("decoder"):
-             ...
-          with name_scope("attention"):
-             ...
+          with fluid.name_scope("s1"):
+              a = fluid.layers.data(name='data', shape=[1], dtype='int32')
+              b = a + 1
+              with fluid.name_scope("s2"):
+                  c = b * 1
+              with fluid.name_scope("s3"):
+                  d = c / 1
+          with fluid.name_scope("s1"):
+              f = fluid.layers.pow(d, 2.0)
+          with fluid.name_scope("s4"):
+              g = f - 1
     """
     # TODO(panyx0718): Only [0-9a-z].
     assert prefix, "namescope prefix cannot be empty."
@@ -313,108 +428,121 @@ class Variable(object):
                  is_data=False,
                  **kwargs):
         self.block = block
-        self.error_clip = error_clip
-
         if name is None:
             name = unique_name.generate('_generated_var')
-        is_new_var = False
-        name = cpt.to_text(name)
-        self.desc = self.block.desc.find_var(cpt.to_bytes(name))
 
-        if self.desc is None:
-            self.desc = self.block.desc.var(cpt.to_bytes(name))
-            is_new_var = True
-
-        if is_new_var:
-            self.desc.set_type(type)
-        elif self.desc.type() != type:
-            raise ValueError("Variable {0} has been created before. The "
-                             "previous type is {1}; the new type is {2}. They"
-                             " are not matched".format(self.name,
-                                                       self.desc.type(), type))
-
-        if shape is not None:
-            if is_new_var:
-                self.desc.set_shape(shape)
-            else:
-                old_shape = self.shape
-                shape = tuple(shape)
-                if shape != old_shape:
-                    raise ValueError(
-                        "Variable {0} has been created before. the previous "
-                        "shape is {1}; the new shape is {2}. They are not "
-                        "matched.".format(self.name, old_shape, shape))
         if dtype is not None:
             if not isinstance(dtype, core.VarDesc.VarType):
                 dtype = convert_np_dtype_to_dtype_(dtype)
-            if is_new_var:
-                self.desc.set_dtype(dtype)
-            else:
-                old_dtype = self.dtype
-                if dtype != old_dtype:
-                    raise ValueError("Variable {0} has been created before. "
-                                     "The previous data type is {1}; the new "
-                                     "data type is {2}. They are not "
-                                     "matched.".format(self.name, old_dtype,
-                                                       dtype))
 
-        if lod_level is not None:
-            if is_new_var:
-                self.desc.set_lod_level(lod_level)
-            else:
-                if lod_level != self.lod_level:
-                    raise ValueError("Variable {0} has been created before. "
-                                     "The previous lod_level is {1}; the new "
-                                     "lod_level is {2}. They are not "
-                                     "matched".format(self.name, self.lod_level,
-                                                      lod_level))
-        if persistable is not None:
-            if is_new_var:
-                self.desc.set_persistable(persistable)
-            else:
-                if persistable != self.persistable:
-                    raise ValueError(
-                        "Variable {0} has been created before."
-                        "The previous persistable is {1}; the new "
-                        "persistable is {2}. They are not matched".format(
-                            self.name, self.persistable, persistable))
-
-        if capacity is not None:
-            if is_new_var:
-                self.desc.set_capacity(capacity)
-            else:
-                # TODO(abhinavarora) : Compare with set capacity once,
-                # get_capacity is implemented
-                pass
-
-        if _in_imperative_mode():
+        if in_dygraph_mode():
             # record vars in tracer rather than blocks
             self._ivar = kwargs.get("ivar", None)
             if not self._ivar:
-                self._ivar = core.VarBase(stop_gradient)
-            self._ivar.desc = self.desc
-            self._ivar.block = block.desc
-            self._ivar.name = name
-            self._ivar.persistable = persistable
+                self._ivar = core.VarBase(
+                    name, dtype if dtype else core.VarDesc.VarType.FP32,
+                    list(shape) if shape else [],
+                    _current_expected_place(), stop_gradient, True
+                    if persistable else False)
             if persistable:
-                self.block.vars[name] = self
+                _dygraph_tracer().trace_var(name, self)
+            self.op = None
         else:
-            self.block.vars[name] = self
-        self.op = None
-        self.stop_gradient = stop_gradient
-        self.is_data = is_data
+            self.error_clip = error_clip
 
-    def _numpy(self):
+            is_new_var = False
+            name = cpt.to_text(name)
+            self.desc = self.block.desc.find_var(cpt.to_bytes(name))
+
+            if self.desc is None:
+                self.desc = self.block.desc.var(cpt.to_bytes(name))
+                is_new_var = True
+
+            if is_new_var:
+                self.desc.set_type(type)
+            elif self.desc.type() != type:
+                raise ValueError(
+                    "Variable {0} has been created before. The "
+                    "previous type is {1}; the new type is {2}. They"
+                    " are not matched".format(self.name, self.desc.type(),
+                                              type))
+
+            if shape is not None:
+                if is_new_var:
+                    self.desc.set_shape(shape)
+                else:
+                    old_shape = self.shape
+                    shape = tuple(shape)
+                    if shape != old_shape:
+                        raise ValueError(
+                            "Variable {0} has been created before. the previous "
+                            "shape is {1}; the new shape is {2}. They are not "
+                            "matched.".format(self.name, old_shape, shape))
+            if dtype is not None:
+                if is_new_var:
+                    self.desc.set_dtype(dtype)
+                else:
+                    old_dtype = self.dtype
+                    if dtype != old_dtype:
+                        raise ValueError(
+                            "Variable {0} has been created before. "
+                            "The previous data type is {1}; the new "
+                            "data type is {2}. They are not "
+                            "matched.".format(self.name, old_dtype, dtype))
+
+            if lod_level is not None:
+                if is_new_var:
+                    self.desc.set_lod_level(lod_level)
+                else:
+                    if lod_level != self.lod_level:
+                        raise ValueError(
+                            "Variable {0} has been created before. "
+                            "The previous lod_level is {1}; the new "
+                            "lod_level is {2}. They are not "
+                            "matched".format(self.name, self.lod_level,
+                                             lod_level))
+            if persistable is not None:
+                if is_new_var:
+                    self.desc.set_persistable(persistable)
+                else:
+                    if persistable != self.persistable:
+                        raise ValueError(
+                            "Variable {0} has been created before."
+                            "The previous persistable is {1}; the new "
+                            "persistable is {2}. They are not matched".format(
+                                self.name, self.persistable, persistable))
+
+            if capacity is not None:
+                if is_new_var:
+                    self.desc.set_capacity(capacity)
+                else:
+                    # TODO(abhinavarora) : Compare with set capacity once,
+                    # get_capacity is implemented
+                    pass
+
+            self.block.vars[name] = self
+            self.op = None
+            self._stop_gradient = stop_gradient
+            self.is_data = is_data
+
+    def numpy(self):
         new_ivar = self._ivar._copy_to(core.CPUPlace(), True)
         return np.array(new_ivar.value().get_tensor())
 
-    def _backward(self):
-        self._ivar._run_backward()
+    def backward(self, backward_strategy=None):
+        from .dygraph import BackwardStrategy
+        if backward_strategy is None:
+            backward_strategy = BackwardStrategy()
+            backward_strategy.sort_sum_gradient = False
 
-    def _gradient(self):
-        return np.array(self._ivar._grad_value())
+        self._ivar._run_backward(backward_strategy)
+        _dygraph_tracer()._clear_ops()
 
-    def _clear_gradient(self):
+    def gradient(self):
+        new_ivar = self._ivar._grad_ivar()._copy_to(core.CPUPlace(), True)
+        return np.array(new_ivar.value().get_tensor())
+
+    def clear_gradient(self):
         self._ivar._clear_gradient()
 
     def __str__(self):
@@ -434,6 +562,12 @@ class Variable(object):
         Returns:
             str: The debug string.
         """
+        if in_dygraph_mode():
+            # TODO(panyx0718): add more dygraph debug info.
+            return 'name %s, dtype: %s shape: %s %s' % (
+                self.name, self.dtype, self.shape,
+                str(self._ivar.value().get_tensor()))
+
         assert isinstance(throw_on_error, bool) and isinstance(with_details,
                                                                bool)
         protostr = self.desc.serialize_to_string()
@@ -448,7 +582,7 @@ class Variable(object):
 
     __repr__ = __str__
 
-    def _set_desc(self, input):
+    def set_desc(self, input):
         """
         Set the variable description.
 
@@ -461,50 +595,73 @@ class Variable(object):
         self.desc = input
 
     @property
-    def _stop_gradient(self):
-        if _in_imperative_mode():
+    def stop_gradient(self):
+        if in_dygraph_mode():
             return self._ivar.stop_gradient
         else:
-            return self.stop_gradient
+            return self._stop_gradient
 
-    @_stop_gradient.setter
-    def _stop_gradient(self, s):
-        if _in_imperative_mode():
+    @stop_gradient.setter
+    def stop_gradient(self, s):
+        if in_dygraph_mode():
             self._ivar.stop_gradient = s
-        self.stop_gradient = s
+        else:
+            self._stop_gradient = s
 
     @property
     def persistable(self):
-        return self.desc.persistable()
+        if in_dygraph_mode():
+            return self._ivar.persistable
+        else:
+            return self.desc.persistable()
 
     @persistable.setter
     def persistable(self, p):
-        self.desc.set_persistable(p)
+        if in_dygraph_mode():
+            return self._ivar.persistable
+        else:
+            self.desc.set_persistable(p)
 
     @property
     def name(self):
-        return cpt.to_text(self.desc.name())
+        if in_dygraph_mode():
+            return self._ivar.name
+        else:
+            return cpt.to_text(self.desc.name())
 
     @name.setter
     def name(self, new_name):
-        self.desc.set_name(new_name)
+        if in_dygraph_mode():
+            self._ivar.name = new_name
+        else:
+            self.desc.set_name(new_name)
 
     @property
     def shape(self):
         # convert to tuple, make it as same as numpy API.
-        return tuple(self.desc.shape())
+        if in_dygraph_mode():
+            return self._ivar.shape
+        else:
+            return tuple(self.desc.shape())
 
     @property
     def dtype(self):
-        return self.desc.dtype()
+        if in_dygraph_mode():
+            return self._ivar.dtype
+        else:
+            return self.desc.dtype()
 
     @property
     def lod_level(self):
+        # TODO(minqiyang): Support lod_level in dygraph mode
         return self.desc.lod_level()
 
     @property
     def type(self):
-        return self.desc.type()
+        if in_dygraph_mode():
+            return self._ivar.dtype
+        else:
+            return self.desc.type()
 
     def _set_error_clip(self, error_clip):
         """
@@ -517,6 +674,194 @@ class Variable(object):
             None
         """
         self.error_clip = error_clip
+
+    def _slice_indices(self, slice, length):
+        """
+        Reference implementation for the slice.indices method.
+        """
+        # Compute step and length as integers.
+        step = 1 if slice.step is None else slice.step
+
+        # Raise ValueError for negative length or zero step.
+        if length < 0:
+            raise ValueError("length should not be negative")
+        if step == 0:
+            raise ValueError("slice step cannot be zero")
+
+        # Find lower and upper bounds for start and stop.
+        lower = -1 if step < 0 else 0
+        upper = length - 1 if step < 0 else length
+
+        # Compute start.
+        if slice.start is None:
+            start = upper if step < 0 else lower
+        else:
+            start = slice.start
+            start = max(start + length, lower) if start < 0 else min(start,
+                                                                     upper)
+
+        # Compute stop.
+        if slice.stop is None:
+            stop = lower if step < 0 else upper
+        else:
+            stop = slice.stop
+            stop = max(stop + length, lower) if stop < 0 else min(stop, upper)
+
+        return start, stop, step
+
+    def _detectEllipsis(self, item):
+        has_ellipsis = False
+        start = 0
+        end = len(self.shape)
+        for index, o in enumerate(item):
+            if o is Ellipsis:
+                if has_ellipsis:
+                    raise ValueError("Index can have one ellipsis only.")
+                has_ellipsis = True
+                start = index
+            else:
+                if has_ellipsis:
+                    end = index
+        return has_ellipsis, start, end
+
+    def _reconstructSliceinfo(self, item):
+        has_ellipsis, start, end = self._detectEllipsis(item)
+        if has_ellipsis:
+            newitem = []
+            for i in range(start):
+                newitem.append(item[i])
+            for i in range(start, end):
+                newitem.append(slice(None, None, None))
+            for i in range(end, len(item)):
+                newitem.append(item[i])
+            return newitem
+        else:
+            return None
+
+    def _detectContinuesSlice(self, item):
+        starts = []
+        ends = []
+        for index, o in enumerate(item):
+            if isinstance(o, int):
+                start = int(o)
+                if (index > 0 and index >= self.shape[index]) \
+                        or (index < 0 and (index + self.shape[index]) < 0):
+                    raise IndexError("invalid index")
+                start = max(start + self.shape[index], 0) if start < 0 else min(
+                    start, self.shape[index])
+                starts.append(start)
+                ends.append(start + 1)
+            elif isinstance(o, slice):
+                start, stop, step = self._slice_indices(o, self.shape[index])
+                if step == 1 or step == -1:
+                    starts.append(start)
+                    ends.append(stop)
+                else:
+                    return False, None
+            else:
+                raise IndexError("Valid index accept int or slice or ellipsis")
+        return True, [starts, ends]
+
+    def _cloneVar(self, copy=False):
+        if not copy:
+            return self.block.create_var(
+                name=unique_name.generate(".".join(self.name)),
+                dtype=self.dtype,
+                persistable=self.persistable,
+                stop_gradient=self.stop_gradient, )
+        else:
+            return self
+
+    def _sliceVar(self, axes, starts, ends):
+        new_var = self._cloneVar()
+        self.block.append_op(
+            type="slice",
+            inputs={'Input': [self]},
+            outputs={'Out': [new_var]},
+            attrs={'axes': axes,
+                   'starts': starts,
+                   'ends': ends})
+        return new_var
+
+    def _concatVar(self, inputs, axis):
+        new_var = self._cloneVar()
+        self.block.append_op(
+            type="concat",
+            inputs={'X': inputs},
+            outputs={'Out': [new_var]},
+            attrs={'axis': axis, })
+        return new_var
+
+    def _sliceAndConcatVar(self, item, axis):
+        if isinstance(item, slice):
+            if self.shape[axis] < 0:
+                return self._cloneVar(True)
+            start, stop, step = self._slice_indices(item, self.shape[axis])
+            if step == 1:
+                return self._sliceVar([axis], [start], [stop])
+            else:
+                vars = []
+                if step > 0:
+                    while start < stop:
+                        vars.append(
+                            self._sliceVar([axis], [start], [start + 1]))
+                        start += step
+                else:
+                    while start > stop:
+                        vars.append(
+                            self._sliceVar([axis], [start], [start + 1]))
+                        start += step
+                return self._concatVar(vars, axis)
+        elif isinstance(item, int):
+            if self.shape[axis] < 0:
+                return self._cloneVar(True)
+            index = int(item)
+            if (index > 0 and index >= self.shape[axis])\
+                    or (index < 0 and (index + self.shape[axis]) < 0):
+                raise IndexError("invalid index")
+            return self._sliceVar([axis], [index], [index + 1])
+        else:
+            raise IndexError("Valid index accept int or slice or tuple")
+
+    def __getitem__(self, item):
+        """
+        Slice the variable.
+
+        Args:
+            item(int/slice/tuple) : the index.
+
+        Returns:
+            Sliced variable
+        """
+        new_var = None
+        if isinstance(item, tuple):
+            if len(item) > len(self.shape):
+                raise IndexError("Too many indexes")
+            fixedSize = True
+            for i in range(len(self.shape)):
+                if self.shape[i] == -1:
+                    fixedSize = False
+                    break
+
+            newitem = self._reconstructSliceinfo(item) or item
+            if fixedSize:
+                check, info = self._detectContinuesSlice(newitem)
+                if check:
+                    starts = info[0]
+                    ends = info[1]
+                    axes = [i for i in range(len(starts))]
+                    return self._sliceVar(axes, starts, ends)
+                else:
+                    new_var = self
+                    for index, o in enumerate(newitem):
+                        new_var = new_var._sliceAndConcatVar(o, index)
+            else:
+                new_var = self
+                for index, o in enumerate(newitem):
+                    new_var = new_var._sliceAndConcatVar(o, index)
+        else:
+            new_var = self._sliceAndConcatVar(item, 0)
+        return new_var
 
 
 def get_all_op_protos():
@@ -620,10 +965,9 @@ class Operator(object):
                                 outputs={"Out": [var1]})
     """
     OP_WITHOUT_KERNEL_SET = {
-        'feed', 'fetch', 'save', 'load', 'recurrent', 'go',
-        'rnn_memory_helper_grad', 'conditional_block', 'while', 'send', 'recv',
-        'listen_and_serv', 'save_combine', 'load_combine', 'ncclInit', 'select',
-        'checkpoint_notify', 'gen_nccl_id'
+        'feed', 'fetch', 'recurrent', 'go', 'rnn_memory_helper_grad',
+        'conditional_block', 'while', 'send', 'recv', 'listen_and_serv',
+        'ncclInit', 'select', 'checkpoint_notify', 'gen_nccl_id'
     }
 
     def __init__(self,
@@ -633,136 +977,130 @@ class Operator(object):
                  inputs=None,
                  outputs=None,
                  attrs=None):
-        self.block = block
-        self.desc = desc
-        # note: not add self.attrs here:
-        # https://github.com/PaddlePaddle/Paddle/pull/12583#pullrequestreview-145093173
-        op_attrs = attrs
-        if op_attrs is None:
-            op_attrs = dict()
-        del attrs
+        if in_dygraph_mode():
+            if type is None:
+                raise ValueError(
+                    "`type` to initialized an Operator can not be None.")
+            self.iop = core.OpBase(type)
+            self.previous_ops = []
 
-        op_maker = core.op_proto_and_checker_maker
-
-        if op_maker.kOpRoleAttrName() not in op_attrs:
-            op_attrs[op_maker.kOpRoleAttrName()] = self.block.program.op_role
-
-        role_var_name = op_maker.kOpRoleVarAttrName()
-        if len(self.block.program.
-               op_role_var) != 0 and role_var_name not in op_attrs:
-            op_attrs[role_var_name] = self.block.program.op_role_var
-
-        if role_var_name in op_attrs and len(op_attrs[role_var_name]) == 0:
-            del op_attrs[role_var_name]
-
-        if len(self.desc.type()) != 0:
-            return
-        if type is None:
-            raise ValueError(
-                "`type` to initilized an Operator can not be None.")
+            self.attrs = attrs if attrs else {}
         else:
-            callstack_var_name = op_maker.kOpCreationCallstackAttrName()
-            op_attrs[callstack_var_name] = list(
-                reversed(traceback.format_stack()))[1:]
+            self.block = block
+            self.desc = desc
+            # note: not add self.attrs here:
+            # https://github.com/PaddlePaddle/Paddle/pull/12583#pullrequestreview-145093173
+            op_attrs = attrs
+            if op_attrs is None:
+                op_attrs = dict()
+            del attrs
 
-        self.desc.set_type(type)
-        proto = OpProtoHolder.instance().get_op_proto(type)
+            op_maker = core.op_proto_and_checker_maker
 
-        namescope_var_name = op_maker.kOpNameScopeAttrName()
-        op_attrs[namescope_var_name] = _full_name_scope()
+            if op_maker.kOpRoleAttrName() not in op_attrs:
+                op_attrs[op_maker.kOpRoleAttrName(
+                )] = self.block.program._op_role
 
-        def find_name(var_list, name):
-            for var_name in var_list:
-                if var_list[var_name] is not None and var_name == name:
-                    return True
-            return False
+            role_var_name = op_maker.kOpRoleVarAttrName()
+            if len(self.block.program.
+                   _op_role_var) != 0 and role_var_name not in op_attrs:
+                op_attrs[role_var_name] = self.block.program._op_role_var
 
-        if inputs is not None:
-            for in_proto in proto.inputs:
-                found = find_name(inputs, in_proto.name)
-                assert found or in_proto.dispensable, "Input {} not found".format(
-                    in_proto.name)
+            if role_var_name in op_attrs and len(op_attrs[role_var_name]) == 0:
+                del op_attrs[role_var_name]
 
-                if found:
-                    in_args = inputs[in_proto.name]
-                    if not isinstance(in_args, list):
-                        in_args = [in_args]
-                    if not in_proto.duplicable and len(in_args) > 1:
-                        raise ValueError(
-                            "Input %s expects only one input, but %d are given."
-                            % (in_proto.name, len(in_args)))
-                    in_arg_names = []
-                    for arg in in_args:
-                        if isinstance(arg, six.string_types):
-                            in_arg_names.append(arg)
-                        elif isinstance(arg, six.binary_type):
-                            in_arg_names.append(arg.decode())
-                        else:
-                            in_arg_names.append(cpt.to_text(arg.name))
-                    self.desc.set_input(in_proto.name, in_arg_names)
-                else:
-                    self.desc.set_input(in_proto.name, [])
+            if len(self.desc.type()) != 0:
+                return
+            if type is None:
+                raise ValueError(
+                    "`type` to initialized an Operator can not be None.")
+            else:
+                callstack_var_name = op_maker.kOpCreationCallstackAttrName()
+                op_attrs[callstack_var_name] = list(
+                    reversed(traceback.format_stack()))[1:]
 
-        if outputs is not None:
-            for m in proto.outputs:
-                if (m.name not in outputs) and m.dispensable:
-                    continue
-                if not ((m.name in outputs) or m.dispensable):
-                    raise ValueError(
-                        ("Incorrect setting for output(s) of "
-                         "operator \"%s\", should set: [%s].") % (type, m.name))
-            for out_proto in proto.outputs:
-                if out_proto.name not in outputs:
-                    continue
-                out_args = outputs[out_proto.name]
-                if not isinstance(out_args, list):
-                    out_args = [out_args]
-                if not out_proto.duplicable and len(out_args) > 1:
-                    raise ValueError(
-                        "Output %s expects only one output, but %d are given." %
-                        (out_proto.name, len(out_args)))
-                out_arg_names = []
-                for arg in out_args:
-                    out_arg_names.append(cpt.to_text(arg.name))
-                    # TODO(minqiyang): could we remove variable's op in static mode?
-                    if not _in_imperative_mode():
-                        arg.op = self
-                self.desc.set_output(out_proto.name, out_arg_names)
+            self.desc.set_type(type)
+            proto = OpProtoHolder.instance().get_op_proto(type)
 
-        if op_attrs is not None:
-            if not isinstance(op_attrs, dict):
-                raise TypeError("'attrs' should be a dict.")
-            for attr in proto.attrs:
-                attr_name = attr.name
-                if (attr_name not in op_attrs) or (op_attrs[attr_name] is None):
-                    continue
-                attr_val = op_attrs[attr_name]
-                self._update_desc_attr(attr_name, attr_val)
+            namescope_var_name = op_maker.kOpNameScopeAttrName()
+            op_attrs[namescope_var_name] = _full_name_scope()
 
-        self.desc.check_attrs()
-        if self._has_kernel(type):
-            self.desc.infer_var_type(self.block.desc)
-            self.desc.infer_shape(self.block.desc)
+            def find_name(var_list, name):
+                for var_name in var_list:
+                    if var_list[var_name] is not None and var_name == name:
+                        return True
+                return False
 
-        if _in_imperative_mode():
-            self.iop = core.OpBase()
-            self.iop.desc = self.desc
-
-            self.inputs = defaultdict(list)
             if inputs is not None:
-                for k, v in six.iteritems(inputs):
-                    if isinstance(v, Variable):
-                        self.inputs[k].append(v._ivar)
-                    elif isinstance(v, list) or isinstance(v, tuple):
-                        self.inputs[k].extend([var._ivar for var in v])
+                for in_proto in proto.inputs:
+                    found = find_name(inputs, in_proto.name)
+                    assert found or in_proto.dispensable, "Input {} not found".format(
+                        in_proto.name)
+                    if found:
+                        in_args = inputs[in_proto.name]
+                        if not isinstance(in_args, list):
+                            in_args = [in_args]
+                        if not in_proto.duplicable and len(in_args) > 1:
+                            raise ValueError(
+                                "Input %s expects only one input, but %d are given."
+                                % (in_proto.name, len(in_args)))
+                        in_arg_names = []
+                        for index, arg in enumerate(in_args):
+                            if isinstance(arg, six.string_types):
+                                in_arg_names.append(arg)
+                            elif isinstance(arg, six.binary_type):
+                                in_arg_names.append(arg.decode())
+                            elif isinstance(arg, Variable):
+                                in_arg_names.append(cpt.to_text(arg.name))
+                            else:
+                                raise ValueError(
+                                    "not suprt args type , should be[ string_type, binary_type, Varibale]"
+                                )
+                        self.desc.set_input(in_proto.name, in_arg_names)
+                    else:
+                        self.desc.set_input(in_proto.name, [])
 
-            self.outputs = defaultdict(list)
             if outputs is not None:
-                for k, v in six.iteritems(outputs):
-                    if isinstance(v, Variable):
-                        self.outputs[k].append(v._ivar)
-                    elif isinstance(v, list) or isinstance(v, tuple):
-                        self.outputs[k].extend([var._ivar for var in v])
+                for m in proto.outputs:
+                    if (m.name not in outputs) and m.dispensable:
+                        continue
+                    if not ((m.name in outputs) or m.dispensable):
+                        raise ValueError(("Incorrect setting for output(s) of "
+                                          "operator \"%s\", should set: [%s].")
+                                         % (type, m.name))
+                for out_proto in proto.outputs:
+                    if out_proto.name not in outputs:
+                        continue
+                    out_args = outputs[out_proto.name]
+                    if not isinstance(out_args, list):
+                        out_args = [out_args]
+                    if not out_proto.duplicable and len(out_args) > 1:
+                        raise ValueError(
+                            "Output %s expects only one output, but %d are given."
+                            % (out_proto.name, len(out_args)))
+                    out_arg_names = []
+                    for arg in out_args:
+                        out_arg_names.append(cpt.to_text(arg.name))
+                        # TODO(minqiyang): could we remove variable's op in static mode?
+                        if not in_dygraph_mode():
+                            arg.op = self
+                    self.desc.set_output(out_proto.name, out_arg_names)
+
+            if op_attrs is not None:
+                if not isinstance(op_attrs, dict):
+                    raise TypeError("'attrs' should be a dict.")
+                for attr in proto.attrs:
+                    attr_name = attr.name
+                    if (attr_name not in op_attrs) or (
+                            op_attrs[attr_name] is None):
+                        continue
+                    attr_val = op_attrs[attr_name]
+                    self._update_desc_attr(attr_name, attr_val)
+
+            self.desc.check_attrs()
+            if self._has_kernel(type):
+                self.desc.infer_var_type(self.block.desc)
+                self.desc.infer_shape(self.block.desc)
 
     def _has_kernel(self, op_type):
         return op_type not in self.OP_WITHOUT_KERNEL_SET
@@ -790,7 +1128,10 @@ class Operator(object):
 
     @property
     def type(self):
-        return self.desc.type()
+        if in_dygraph_mode():
+            return self.iop.type
+        else:
+            return self.desc.type()
 
     def input(self, name):
         """
@@ -905,6 +1246,9 @@ class Operator(object):
             ValueError: If the type of value doesn't match with desc.attr_type(name).
         """
         self._update_desc_attr(name, val)
+
+    def _remove_attr(self, name):
+        self.desc.remove_attr(name)
 
     def _update_desc_attr(self, name, val):
         """
@@ -1046,7 +1390,9 @@ class Block(object):
     Examples:
         .. code-block:: python
 
-            cur_program = Program()
+            import paddle.fluid as fluid
+
+            cur_program = fluid.Program()
             cur_block = cur_program.current_block()
             var = cur_block.create_var(name="X",
                                        shape=[-1, 23, 48],
@@ -1327,23 +1673,38 @@ class Block(object):
         Returns:
             Operator: the append Operator.
         """
-        op_desc = self.desc.append_op()
-        op = Operator(
-            block=self,
-            desc=op_desc,
-            type=kwargs.get("type", None),
-            inputs=kwargs.get("inputs", None),
-            outputs=kwargs.get("outputs", None),
-            attrs=kwargs.get("attrs", None))
+        if in_dygraph_mode():
+            attrs = kwargs.get("attrs", {})
+            if _dygraph_tracer_._train_mode == False:
+                # eval mode
+                attrs['is_test'] = True
 
-        if _in_imperative_mode():
+            op = Operator(
+                block=self,
+                desc=None,
+                type=kwargs.get("type", None),
+                inputs=None,
+                outputs=None,
+                attrs=attrs)
+
             # record ops in tracer rather than blocks
             #
             # TODO(minqiyang): add op stop_gradient support in static mode too.
-            # currently, we only support stop_gradient in imperative mode.
-            _imperative_tracer().trace_op(op,
-                                          kwargs.get("stop_gradient", False))
+            # currently, we only support stop_gradient in dygraph mode.
+            _dygraph_tracer().trace_op(op,
+                                       kwargs.get("inputs", {}),
+                                       kwargs.get("outputs", {}),
+                                       kwargs.get("stop_gradient", False))
         else:
+            op_desc = self.desc.append_op()
+            op = Operator(
+                block=self,
+                desc=op_desc,
+                type=kwargs.get("type", None),
+                inputs=kwargs.get("inputs", None),
+                outputs=kwargs.get("outputs", None),
+                attrs=kwargs.get("attrs", None))
+
             self.ops.append(op)
 
         return op
@@ -1392,19 +1753,30 @@ class Block(object):
         return self.ops[start:end]
 
     def _prepend_op(self, *args, **kwargs):
-        op_desc = self.desc._prepend_op()
-        op = Operator(
-            self,
-            op_desc,
-            type=kwargs.get("type", None),
-            inputs=kwargs.get("inputs", None),
-            outputs=kwargs.get("outputs", None),
-            attrs=kwargs.get("attrs", None))
-        if _in_imperative_mode():
-            _imperative_tracer().trace_op(op,
-                                          kwargs.get("stop_gradient", False))
+        if in_dygraph_mode():
+            op = Operator(
+                self,
+                None,
+                type=kwargs.get("type", None),
+                inputs=None,
+                outputs=None,
+                attrs=kwargs.get("attrs", {}))
+
+            _dygraph_tracer().trace_op(op,
+                                       kwargs.get("inputs", {}),
+                                       kwargs.get("outputs", {}),
+                                       kwargs.get("stop_gradient", False))
         else:
+            op_desc = self.desc._prepend_op()
+            op = Operator(
+                self,
+                op_desc,
+                type=kwargs.get("type", None),
+                inputs=kwargs.get("inputs", None),
+                outputs=kwargs.get("outputs", None),
+                attrs=kwargs.get("attrs", None))
             self.ops.insert(0, op)
+
         return op
 
     def _sync_with_cpp(self):
@@ -1512,12 +1884,15 @@ class Block(object):
                 name=v.name)
             self.vars[new_p.name] = new_p
 
-    def _clone_variable(self, var):
+    def _clone_variable(self, var, force_persistable=True):
         """
         Clone a variable into current block.
 
         Args:
             var: the variable to be cloned.
+            force_persistable(bool): True means setting the result variable to being persistable.
+                                     False means setting the persistable the same with that of input var.
+                                     default: True.
 
         Returns:
             Variable: the new  variable cloned from 'var' in current block.
@@ -1537,7 +1912,7 @@ class Block(object):
                 shape=var.shape,
                 dtype=var.dtype,
                 type=var.type,
-                persistable=True,
+                persistable=True if force_persistable else var.persistable,
                 is_data=var.is_data)
         else:
             ret_var = self.create_var(
@@ -1546,7 +1921,7 @@ class Block(object):
                 dtype=var.dtype,
                 type=var.type,
                 lod_level=var.lod_level,
-                persistable=True,
+                persistable=True if force_persistable else var.persistable,
                 is_data=var.is_data)
         return ret_var
 
@@ -1917,6 +2292,28 @@ class IrOpNode(IrNode):
         else:
             desc._set_attr(name, val)
 
+    def input_arg_names(self):
+        """
+        Return input arguments' names of this op node.
+
+        Returns:
+            list(str): input arguments' names of this op node.
+        """
+        assert self.node.op() is not None, \
+            "The node operator description cannot be None."
+        return self.node.op().input_arg_names()
+
+    def output_arg_names(self):
+        """
+        Return output arguments' names of this op node.
+
+        Returns:
+            list(str): output arguments' names of this op node.
+        """
+        assert self.node.op() is not None, \
+            "The node operator description cannot be None."
+        return self.node.op().output_arg_names()
+
     @property
     def inputs(self):
         """
@@ -1959,6 +2356,19 @@ class IrGraph(object):
         self.graph = graph
         self._for_test = for_test
 
+    def clone(self):
+        """
+        Create a new and duplicated IrGraph.
+
+        Warns:
+            The method only clones the graph structure, not its attributes.
+
+        Returns:
+            IrGraph: A new and duplicated graph.
+        """
+        g = self.graph.clone()
+        return IrGraph(g, self._for_test)
+
     def is_test(self):
         """
         If the graph is used for testing, the function returns true. Otherwise, returns false.
@@ -1993,33 +2403,6 @@ class IrGraph(object):
         Return all operator nodes included in the graph as a set.
         """
         return {IrOpNode(node) for node in self.graph.nodes() if node.is_op()}
-
-    def var_node(self, name):
-        """
-        Get a variable node by name from the graph.
-
-        Args:
-            name(str): the name of the variable node.
-
-        Raises:
-            ValueError: The If input's type is not str, or this graph
-            doesn't have a variable with the giving name.
-
-        Returns:
-            IrVarNode: the variable node with the giving name.
-        """
-        if not isinstance(name, six.string_types):
-            raise TypeError(
-                "var require string as parameter, but get %s instead." %
-                (type(name)))
-        target_var_node = None
-        var_nodes = self.all_var_nodes()
-        for var_node in var_nodes:
-            if var_node.name() == name:
-                target_var_node = var_node
-        if target_var_node is None:
-            raise ValueError("var_node %s not in this graph" % name)
-        return target_var_node
 
     def create_persistable_node(self, name, var_type, shape, var_dtype):
         """
@@ -2164,6 +2547,27 @@ class IrGraph(object):
         original_nodes = {n.node for n in remove_nodes}
         core.graph_safe_remove_nodes(self.graph, original_nodes)
 
+    def resolve_hazard(self):
+        ordered_nodes = core.topology_sort(self.graph)
+        var_nodes = dict()
+        for node in ordered_nodes:
+            if node.is_op() and node.op() is not None:
+                for each_var_name in node.op().input_arg_names():
+                    if each_var_name not in var_nodes:
+                        var_nodes[each_var_name] = [
+                            self._find_node_by_name(node.inputs, each_var_name)
+                        ]
+                for each_var_name in node.op().output_arg_names():
+                    if each_var_name not in var_nodes:
+                        var_nodes[each_var_name] = [
+                            self._find_node_by_name(node.outputs, each_var_name)
+                        ]
+                    else:
+                        var_nodes[each_var_name].append(
+                            self._find_node_by_name(node.outputs,
+                                                    each_var_name))
+        self.graph.resolve_hazard(var_nodes)
+
     def has_circle(self):
         """
         Check if the graph has a circle.
@@ -2189,10 +2593,10 @@ class IrGraph(object):
         Notes: the `graph` cannot contain a circle.
 
         Returns:
-            set(IrNode): nodes in topology order.
+            list(IrNode): nodes in topology order.
         """
         ordered_nodes = core.topology_sort(self.graph)
-        return {IrNode(n) for n in ordered_nodes}
+        return [IrNode(n) for n in ordered_nodes]
 
     def build_adjacency_list(self):
         """
@@ -2260,7 +2664,7 @@ class IrGraph(object):
         """
         Convert the graph into a Program.
 
-        Notes: When the graph includes backward operator nodes, the
+        WARN: When the graph includes backward operator nodes, the
         conversion process may be failed. Usually, this function is
         only used to convert a test graph.
 
@@ -2273,6 +2677,17 @@ class IrGraph(object):
         convert_pass.apply(self.graph)
         program = Program._construct_from_desc(desc)
         return program
+
+    def _find_node_by_name(self, nodes, node_name):
+        """
+        Find a node in the giving nodes set by the name.
+        """
+        target_node = None
+        for n in nodes:
+            if n.name() == node_name:
+                target_node = n
+        assert target_node is not None, "Cannot find the target node in the giving set."
+        return target_node
 
     def _update_desc_attr(self, desc, name, val):
         """
@@ -2308,12 +2723,19 @@ class Program(object):
         A empty program.
 
     Examples:
-        >>> main_program = fluid.Program()
-        >>> startup_program = fluid.Program()
-        >>> with fluid.program_guard(main_program=main_program, startup_program=startup_program):
-        >>>     fluid.layers.data(name="x", shape=[-1, 784], dtype='float32')
-        >>>     fluid.layers.data(name="y", shape=[-1, 1], dtype='int32')
-        >>>     fluid.layers.fc(name="fc", shape=[10], dtype='float32', act="relu")
+        .. code-block:: python
+
+            import paddle.fluid as fluid
+
+            main_program = fluid.Program()
+            startup_program = fluid.Program()
+            with fluid.program_guard(main_program=main_program, startup_program=startup_program):
+                x = fluid.layers.data(name="x", shape=[-1, 784], dtype='float32')
+                y = fluid.layers.data(name="y", shape=[-1, 1], dtype='int32')
+                z = fluid.layers.fc(name="fc", input=x, size=10, act="relu")
+
+            print("main program is: {}".format(main_program))
+            print("start up program is: {}".format(startup_program))
 
     """
 
@@ -2323,7 +2745,7 @@ class Program(object):
         self.current_block_idx = 0
         self._seed = 0
         self._current_role = core.op_proto_and_checker_maker.OpRole.Forward
-        self._op_role_var = []
+        self.__op_role_var = []
 
         # for distribute training
         # _is_distributed = True if under distributed training
@@ -2340,9 +2762,22 @@ class Program(object):
         self._trainers_endpoints = []
         # the distributed lookup table names
         self._distributed_lookup_table = None
+
+        # use Deep gradient comrepssion or not
+        self._enable_dgc = False
+        self._nccl_comm_num = 1
+        self._use_hierarchical_allreduce = False
+        self._hierarchical_allreduce_inter_nranks = 0
+        self._hierarchical_allreduce_exter_nranks = 0
+
         # @deprecated(the python memory optimize transpiler is deprecated)
         # whether the program is optimized by memory_optimize_transpiler
         self.__is_mem_optimized = False
+
+        # if this program has been optimized by distributed optimizer
+        # fleet_opt will be given a value
+        self._fleet_opt = None
+        self._program_config = None
 
     @property
     def _is_mem_optimized(self):
@@ -2355,7 +2790,7 @@ class Program(object):
         self.__is_mem_optimized = target
 
     @property
-    def op_role(self):
+    def _op_role(self):
         """
         The operator role. In a enum {Forward, Backward, Optimize}.
 
@@ -2364,31 +2799,36 @@ class Program(object):
 
         For example, the forward operator should be executed on every device.
         The backward operator should be executed on every device and the
-        parameter gradient of backward (use :code:`op_role_var` to get this
+        parameter gradient of backward (use :code:`_op_role_var` to get this
         variable) operator should be merged to one device. The optimization
         operators should be executed on only one device and broadcast the
         optimization result, i.e., the new parameter, to every other device.
         """
         return self._current_role
 
-    @op_role.setter
-    def op_role(self, role):
+    @_op_role.setter
+    def _op_role(self, role):
         self._current_role = role
 
     @property
-    def op_role_var(self):
+    def _op_role_var(self):
         """
-        The auxiliary variables for :code:`op_role` property.
+        The auxiliary variables for :code:`_op_role` property.
 
-        See Also: :code:`Program.op_role`'s documentation for details.
+        See Also: :code:`Program._op_role`'s documentation for details.
 
         Notes: This is a very low-level API. Users should not use it directly.
         """
-        return self._op_role_var
+        return self.__op_role_var
 
-    @op_role_var.setter
-    def set_op_role_var(self, var_name):
-        self._op_role_var = [var_name]
+    @contextlib.contextmanager
+    def _backward_role_guard(self):
+        tmp_role = self._current_role
+
+        OpRole = core.op_proto_and_checker_maker.OpRole
+        self._current_role = OpRole.Backward
+        yield
+        self._current_role = tmp_role
 
     @signature_safe_contextmanager
     def _optimized_guard(self, param_and_grads):
@@ -2408,16 +2848,16 @@ class Program(object):
             >>>     p = p - 0.001 * g
         """
         tmp_role = self._current_role
-        tmp_var = self._op_role_var
+        tmp_var = self.__op_role_var
 
         OpRole = core.op_proto_and_checker_maker.OpRole
         self._current_role = OpRole.Optimize
-        self._op_role_var = [
+        self.__op_role_var = [
             var.name if isinstance(var, Variable) else var
             for var in param_and_grads
         ]
         yield
-        self._op_role_var = tmp_var
+        self.__op_role_var = tmp_var
         self._current_role = tmp_role
 
     @signature_safe_contextmanager
@@ -2442,16 +2882,16 @@ class Program(object):
         """
 
         tmp_role = self._current_role
-        tmp_var = self._op_role_var
+        tmp_var = self.__op_role_var
 
         OpRole = core.op_proto_and_checker_maker.OpRole
         self._current_role = OpRole.LRSched
         if is_with_opt:
             self._current_role = int(OpRole.LRSched) | int(OpRole.Optimize)
         # TODO(typhoonzero): how to set target learning rate var
-        self._op_role_var = []
+        self.__op_role_var = []
         yield
-        self._op_role_var = tmp_var
+        self.__op_role_var = tmp_var
         self._current_role = tmp_role
 
     def __str__(self):
@@ -2484,6 +2924,15 @@ class Program(object):
         Raises:
             ValueError: If any of required fields is not set and throw_on_error is
                 True.
+
+        Examples:
+            .. code-block:: python
+
+                import paddle.fluid as fluid
+
+                prog = fluid.default_main_program()
+                prog_string = prog.to_string(throw_on_error=True, with_details=False)
+                print(prog_string)
 
         """
         assert isinstance(throw_on_error, bool) and isinstance(with_details,
@@ -2524,13 +2973,20 @@ class Program(object):
 
         * Set for_test to False when we want to clone the program for training.
         * Set for_test to True when we want to clone the program for testing.
+          We will not do any prune on program here, So if you just want an
+          forward program for testing, please use :code:`clone` before using
+          :code:`Opimizer.minimize`
 
-        Notes: This API DOES NOT prune any operator. Use
-        :code:`clone(for_test=True)` before backward and optimization please. e.g.
+        Notes: 
+        1. :code:`Program.clone()` method DOES NOT clone :code:`py_reader`.
+        2. This API DOES NOT prune any operator. Use
+        :code:`clone(for_test=True)` before backward and optimization please. E.g.
 
-            >>> test_program = fluid.default_main_program().clone(for_test=True)
-            >>> optimizer = fluid.optimizer.Momentum(learning_rate=0.01, momentum=0.9)
-            >>> optimizer.minimize()
+        .. code-block:: python
+
+            test_program = fluid.default_main_program().clone(for_test=True)
+            optimizer = fluid.optimizer.Momentum(learning_rate=0.01, momentum=0.9)
+            optimizer.minimize()
 
         Args:
             for_test(bool): True if change the :code:`is_test` attribute of
@@ -2541,55 +2997,107 @@ class Program(object):
 
         Examples:
 
-            1. To clone a test program, the sample code is:
+        Notes: The Program Descs' order maybe different after :code:`clone` and
+        this will not affect your training or testing progress. In the following
+        example we give you an simple method :code:`print_prog(program)` to
+        print Program Descs inorder to make sure you have same print result
+        after :code:`clone`:
 
-            >>> import paddle.fluid as fluid
-            >>> train_program = fluid.Program()
-            >>> startup_program = fluid.Program()
-            >>> with fluid.program_guard(train_program, startup_program):
-            >>>     img = fluid.layers.data(name='image', shape=[784])
-            >>>     hidden = fluid.layers.fc(input=img, size=200, act='relu')
-            >>>     hidden = fluid.layers.dropout(hidden, dropout_prob=0.5)
-            >>>     loss = fluid.layers.cross_entropy(
-            >>>                 input=fluid.layers.fc(hidden, size=10, act='softmax'),
-            >>>                 label=fluid.layers.data(name='label', shape=[1], dtype='int64'))
-            >>>
-            >>> test_program = train_program.clone(for_test=True)
-            >>>
-            >>> sgd = fluid.optimizer.SGD(learning_rate=1e-3)
-            >>> with fluid.program_guard(train_program, startup_program):
-            >>>     sgd.minimize(loss)
+            .. code-block:: python
 
-            2. The :code:`clone` method can be avoid if you create program for
-            training and program for testing individually.
+                import paddle.fluid as fluid
+                import six
 
-            >>> import paddle.fluid as fluid
-            >>>
-            >>> def network(is_test):
-            >>>     img = fluid.layers.data(name='image', shape=[784])
-            >>>     hidden = fluid.layers.fc(input=img, size=200, act='relu')
-            >>>     hidden = fluid.layers.dropout(hidden, dropout_prob=0.5, is_test=is_test)
-            >>>     loss = fluid.layers.cross_entropy(
-            >>>                 input=fluid.layers.fc(hidden, size=10, act='softmax'),
-            >>>                 label=fluid.layers.data(name='label', shape=[1], dtype='int64'))
-            >>>     return loss
-            >>>
-            >>> train_program = fluid.Program()
-            >>> startup_program = fluid.Program()
-            >>> test_program = fluid.Program()
-            >>>
-            >>> with fluid.program_guard(train_program, startup_program):
-            >>>     with fluid.unique_name.guard():
-            >>>         loss = network(is_test=False)
-            >>>         sgd = fluid.optimizer.SGD(learning_rate=1e-3)
-            >>>         sgd.minimize(loss)
-            >>>
-            >>> # the test startup program is not used.
-            >>> with fluid.program_guard(test_program, fluid.Program()):
-            >>>     with fluid.unique_name.guard():
-            >>>         loss = network(is_test=True)
 
-            The two code snippets above will generate same programs.
+                def print_prog(prog):
+                    for name, value in sorted(six.iteritems(prog.block(0).vars)):
+                        print(value)
+                    for op in prog.block(0).ops:
+                        print("op type is {}".format(op.type))
+                        print("op inputs are {}".format(op.input_arg_names))
+                        print("op outputs are {}".format(op.output_arg_names))
+                        for key, value in sorted(six.iteritems(op.all_attrs())):
+                            if key not in ['op_callstack', 'op_role_var']:
+                                print(" [ attrs: {}:   {} ]".format(key, value))
+
+
+        1. To clone a test program, the sample code is:
+                .. code-block:: python
+
+                    import paddle.fluid as fluid
+                    import six
+
+                    def print_prog(prog):
+                        for name, value in sorted(six.iteritems(prog.block(0).vars)):
+                            print(value)
+                        for op in prog.block(0).ops:
+                            print("op type is {}".format(op.type))
+                            print("op inputs are {}".format(op.input_arg_names))
+                            print("op outputs are {}".format(op.output_arg_names))
+                            for key, value in sorted(six.iteritems(op.all_attrs())):
+                                if key not in ['op_callstack', 'op_role_var']:
+                                    print(" [ attrs: {}:   {} ]".format(key, value))
+
+                    train_program = fluid.Program()
+                    startup_program = fluid.Program()
+                    with fluid.program_guard(train_program, startup_program):
+                        with fluid.unique_name.guard():
+                            img = fluid.layers.data(name='image', shape=[784])
+                            hidden = fluid.layers.fc(input=img, size=200, act='relu')
+                            hidden = fluid.layers.dropout(hidden, dropout_prob=0.5)
+                            loss = fluid.layers.cross_entropy(
+                                                      input=fluid.layers.fc(hidden, size=10, act='softmax'),
+                                        label=fluid.layers.data(name='label', shape=[1], dtype='int64'))
+                            avg_loss = fluid.layers.mean(loss)
+                            test_program = train_program.clone(for_test=False)
+                    print_prog(test_program)
+                    with fluid.program_guard(train_program, startup_program):
+                        with fluid.unique_name.guard():
+                            sgd = fluid.optimizer.SGD(learning_rate=1e-3)
+                            sgd.minimize(avg_loss)
+
+
+        2. The clone method can be avoid if you create program for training and program for testing individually.
+                .. code-block:: python
+
+                    import paddle.fluid as fluid
+                    import six
+
+                    def print_prog(prog):
+                        for name, value in sorted(six.iteritems(prog.block(0).vars)):
+                            print(value)
+                        for op in prog.block(0).ops:
+                            print("op type is {}".format(op.type))
+                            print("op inputs are {}".format(op.input_arg_names))
+                            print("op outputs are {}".format(op.output_arg_names))
+                            for key, value in sorted(six.iteritems(op.all_attrs())):
+                                if key not in ['op_callstack', 'op_role_var']:
+                                    print(" [ attrs: {}:   {} ]".format(key, value))
+                    def network(is_test):
+                        img = fluid.layers.data(name='image', shape=[784])
+                        hidden = fluid.layers.fc(input=img, size=200, act='relu')
+                        hidden = fluid.layers.dropout(hidden, dropout_prob=0.5)
+                        loss = fluid.layers.cross_entropy(
+                            input=fluid.layers.fc(hidden, size=10, act='softmax'),
+                            label=fluid.layers.data(name='label', shape=[1], dtype='int64'))
+                        avg_loss = fluid.layers.mean(loss)
+                        return avg_loss
+
+
+                    train_program_2 = fluid.Program()
+                    startup_program_2 = fluid.Program()
+                    test_program_2 = fluid.Program()
+                    with fluid.program_guard(train_program_2, startup_program_2):
+                        with fluid.unique_name.guard():
+                             sgd = fluid.optimizer.SGD(learning_rate=1e-3)
+                             sgd.minimize(avg_loss)
+                    # the test startup program is not used.
+                    with fluid.program_guard(test_program_2, fluid.Program()):
+                        with fluid.unique_name.guard():
+                            loss = network(is_test=True)
+                    print(test_program_2)
+
+        The two code snippets above will generate and print same programs.
         """
         if for_test:
             p = self._inference_optimize(prune_read_op=False)
@@ -2603,7 +3111,7 @@ class Program(object):
             ]
 
             p._current_role = self._current_role
-            p._op_role_var = self._op_role_var
+            p.__op_role_var = self.__op_role_var
 
             p._sync_with_cpp()
 
@@ -2759,6 +3267,17 @@ class Program(object):
         the random seed from random device.
 
         Notes: It must be set before the operators have been added.
+
+        Examples:
+            .. code-block:: python
+
+                import paddle.fluid as fluid
+
+                prog = fluid.default_main_program()
+                random_seed = prog.random_seed
+                print(random_seed)
+                prog.random_seed = 1
+                print(prog.random_seed)
         """
         return self._seed
 
@@ -2766,6 +3285,15 @@ class Program(object):
     def num_blocks(self):
         """
         The number of blocks in this program.
+
+        Examples:
+            .. code-block:: python
+
+                import paddle.fluid as fluid
+
+                prog = fluid.default_main_program()
+                num_blocks = prog.num_blocks
+                print(num_blocks)
         """
         return self.desc.num_blocks()
 
@@ -2781,6 +3309,15 @@ class Program(object):
     def global_block(self):
         """
         Get the first block of this program.
+
+        Examples:
+            .. code-block:: python
+
+                import paddle.fluid as fluid
+
+                prog = fluid.default_main_program()
+                gb_block = prog.global_block()
+                print(gb_block)
         """
         return self.blocks[0]
 
@@ -2792,6 +3329,15 @@ class Program(object):
 
         Returns:
             Block: The :code:`index` block
+
+        Examples:
+            .. code-block:: python
+
+                import paddle.fluid as fluid
+
+                prog = fluid.default_main_program()
+                block_0 = prog.block(0)
+                print(block_0)
         """
         return self.blocks[index]
 
@@ -2799,6 +3345,15 @@ class Program(object):
         """
         Get the current block. The :code:`current` block is the block to append
         operators.
+
+        Examples:
+            .. code-block:: python
+
+                import paddle.fluid as fluid
+
+                prog = fluid.default_main_program()
+                current_blk = prog.current_block()
+                print(current_blk)
         """
         return self.blocks[self.current_block_idx]
 
@@ -2917,6 +3472,17 @@ class Program(object):
 
         Returns:
             iterable: The generator will yield every variable in this program.
+
+        Examples:
+            .. code-block:: python
+
+                import paddle.fluid as fluid
+
+                prog = fluid.default_main_program()
+                img = fluid.layers.data(name='img', shape=[1,28,28], dtype='float32')
+                label = fluid.layers.data(name='label', shape=[128,1], dtype='int64')
+                for var in prog.list_vars():
+                    print(var)
         """
         for each_block in self.blocks:
             for each_var in list(each_block.vars.values()):
@@ -2985,6 +3551,15 @@ class Parameter(Variable):
 
         Returns(str): The debug string.
 
+        Examples:
+            .. code-block:: python
+
+                import paddle.fluid as fluid
+
+                prog = fluid.default_main_program()
+                rlt = fluid.layers.data("fake_data", shape=[1,1], dtype='float32')
+                debug_str = prog.to_string(throw_on_error=True, with_details=False)
+                print(debug_str)
         """
         assert isinstance(throw_on_error, bool) and isinstance(with_details,
                                                                bool)
@@ -3021,6 +3596,21 @@ def default_startup_program():
 
     Returns:
         Program: startup program
+
+    Examples:
+        .. code-block:: python
+
+            import paddle.fluid as fluid
+
+            main_program = fluid.Program()
+            startup_program = fluid.Program()
+            with fluid.program_guard(main_program=main_program, startup_program=startup_program):
+                x = fluid.layers.data(name="x", shape=[-1, 784], dtype='float32')
+                y = fluid.layers.data(name="y", shape=[-1, 1], dtype='int32')
+                z = fluid.layers.fc(name="fc", input=x, size=10, act="relu")
+
+                print("main program is: {}".format(fluid.default_main_program()))
+                print("start up program is: {}".format(fluid.default_startup_program()))
     """
     return _startup_program_
 
@@ -3039,6 +3629,35 @@ def default_main_program():
 
     Returns:
         Program: main program
+
+    Examples:
+        ..  code-block:: python
+
+            import paddle.fluid as fluid
+            
+            # Sample Network:
+            data = fluid.layers.data(name='image', shape=[3, 224, 224], dtype='float32')
+            label = fluid.layers.data(name='label', shape=[1], dtype='int64')
+            
+            conv1 = fluid.layers.conv2d(data, 4, 5, 1, act=None)
+            bn1 = fluid.layers.batch_norm(conv1, act='relu')
+            pool1 = fluid.layers.pool2d(bn1, 2, 'max', 2)
+            conv2 = fluid.layers.conv2d(pool1, 16, 5, 1, act=None)
+            bn2 = fluid.layers.batch_norm(conv2, act='relu')
+            pool2 = fluid.layers.pool2d(bn2, 2, 'max', 2)
+            
+            fc1 = fluid.layers.fc(pool2, size=50, act='relu')
+            fc2 = fluid.layers.fc(fc1, size=102, act='softmax')
+            
+            loss = fluid.layers.cross_entropy(input=fc2, label=label)
+            loss = fluid.layers.mean(loss)
+            opt = fluid.optimizer.Momentum(
+                learning_rate=0.1,
+                momentum=0.9,
+                regularization=fluid.regularizer.L2Decay(1e-4))
+            opt.minimize(loss)
+            
+            print(fluid.default_main_program())
     """
     return _main_program_
 
@@ -3077,34 +3696,38 @@ def switch_startup_program(program):
 @signature_safe_contextmanager
 def program_guard(main_program, startup_program=None):
     """
-    Change the global main program and startup program with `with` statement.
-    Layer functions in the Python `with` block will append operators and
+    Change the global main program and startup program with `"with"` statement.
+    Layer functions in the Python `"with"` block will append operators and
     variables to the new main programs.
 
     Examples:
+       .. code-block:: python
+       
+         import paddle.fluid as fluid
 
-        >>> import paddle.fluid as fluid
-        >>> main_program = fluid.Program()
-        >>> startup_program = fluid.Program()
-        >>> with fluid.program_guard(main_program, startup_program):
-        >>>     data = fluid.layers.data(...)
-        >>>     hidden = fluid.layers.fc(...)
+         main_program = fluid.Program()
+         startup_program = fluid.Program()
+         with fluid.program_guard(main_program, startup_program):
+             data = fluid.layers.data(name='image', shape=[784, 784], dtype='float32')
+             hidden = fluid.layers.fc(input=data, size=10, act='relu')
 
     Notes: The temporary :code:`Program` can be used if the user does not need
     to construct either of startup program or main program.
 
     Examples:
+       .. code-block:: python
 
-        >>> import paddle.fluid as fluid
-        >>> main_program = fluid.Program()
-        >>> # does not care about startup program. Just pass a temporary value.
-        >>> with fluid.program_guard(main_program, fluid.Program()):
-        >>>     data = ...
+         import paddle.fluid as fluid
+
+         main_program = fluid.Program()
+         # does not care about startup program. Just pass a temporary value.
+         with fluid.program_guard(main_program, fluid.Program()):
+             data = fluid.layers.data(name='image', shape=[784, 784], dtype='float32')
 
     Args:
-        main_program(Program): New main program inside `with` statement.
-        startup_program(Program): New startup program inside `with` statement.
-            None means do not change startup program.
+        main_program(Program): New main program inside `"with"` statement.
+        startup_program(Program): New startup program inside `"with"` statement.
+            None means not changing startup program.
     """
     if not isinstance(main_program, Program):
         raise TypeError("main_program should be Program")
@@ -3140,22 +3763,22 @@ def _get_var(name, program=None):
 
 
 @signature_safe_contextmanager
-def _imperative_guard(tracer):
-    global _imperative_tracer_
-    tmp_trace = _imperative_tracer_
-    _imperative_tracer_ = tracer
+def _dygraph_guard(tracer):
+    global _dygraph_tracer_
+    tmp_trace = _dygraph_tracer_
+    _dygraph_tracer_ = tracer
 
     yield
 
-    _imperative_tracer_ = tmp_trace
+    _dygraph_tracer_ = tmp_trace
 
 
 @signature_safe_contextmanager
-def _imperative_place_guard(place):
-    global _imperative_current_expected_place_
-    tmp_place = _imperative_current_expected_place_
-    _imperative_current_expected_place_ = place
+def _dygraph_place_guard(place):
+    global _dygraph_current_expected_place_
+    tmp_place = _dygraph_current_expected_place_
+    _dygraph_current_expected_place_ = place
 
     yield
 
-    _imperative_current_expected_place_ = tmp_place
+    _dygraph_current_expected_place_ = tmp_place
